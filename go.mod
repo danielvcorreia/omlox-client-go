@@ -10,6 +10,7 @@ require (
 	github.com/nsf/jsondiff v0.0.0-20230430225905-43f6cf3098c1
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/pflag v1.0.5
+	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/geojson v1.4.3
 	golang.org/x/time v0.4.0
 	nhooyr.io/websocket v1.8.10
@@ -17,7 +18,9 @@ require (
 
 require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.3 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/tidwall/geoindex v1.4.4 // indirect
 	github.com/tidwall/gjson v1.12.1 // indirect
