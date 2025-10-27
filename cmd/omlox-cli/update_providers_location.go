@@ -23,8 +23,8 @@ func newUpdateProvidersLocationsCmd(settings cli.EnvSettings, out io.Writer) *co
 	var files []string
 
 	cmd := &cobra.Command{
-		Use:     "providers",
-		Aliases: []string{"location_providers"},
+		Use:     "providers_locations",
+		Aliases: []string{"location_providers_locations"},
 		Short:   "Update location providers locations in the Hub",
 		Long:    updateProviderLocationHelp,
 		Args:    cobra.ExactArgs(0),
