@@ -6,6 +6,7 @@ package omlox_test
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/wavecomtech/omlox-client-go"
 )
@@ -25,6 +26,7 @@ func ExampleNew() {
 }
 
 func ExampleConnect() {
+	// Create client with auto-reconnection enabled, unlimited retries, and backoff timing
 	// Dials a Omlox Hub websocket interface, subscribes to
 	// the location_updates topic and listens to new
 	// location messages.
@@ -32,7 +34,13 @@ func ExampleConnect() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client, err := omlox.Connect(ctx, "localhost:7081/v2")
+	client, err := omlox.Connect(
+		ctx,
+		"localhost:7081/v2",
+		omlox.WithWSAutoReconnect(true),
+		omlox.WithWSMaxRetries(-1),
+		omlox.WithWSRetryWait(time.Second, 30*time.Second),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}

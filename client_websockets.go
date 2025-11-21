@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"time"
 
-	"golang.org/x/sync/errgroup"
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 )
@@ -69,8 +68,74 @@ func Connect(ctx context.Context, addr string, options ...ClientOption) (*Client
 	return c, nil
 }
 
-// Connect dials the Omlox™ Hub websockets interface.
+// Connect dials the Omlox™ Hub websockets interface with automatic retry support.
+// It follows the go-retryablehttp pattern for handling connection failures.
 func (c *Client) Connect(ctx context.Context) error {
+	var err error
+	var shouldRetry bool
+	var attempt int
+
+	// Setup reconnection context if auto-reconnect is enabled
+	if c.configuration.WSAutoReconnect {
+		c.mu.Lock()
+		c.reconnectCtx, c.reconnectCancel = context.WithCancel(context.Background())
+		c.mu.Unlock()
+	}
+
+	for attempt = 0; ; attempt++ {
+		err = c.connect(ctx)
+		if err == nil {
+			return nil
+		}
+
+		// Check if we should retry
+		shouldRetry, err = c.configuration.WSCheckRetry(ctx, attempt, err)
+		if !shouldRetry {
+			break
+		}
+
+		// Check retry limit
+		remain := c.configuration.WSMaxRetries - attempt
+		if c.configuration.WSMaxRetries >= 0 && remain <= 0 {
+			break
+		}
+
+		// Calculate backoff wait time
+		wait := c.configuration.WSBackoff(
+			c.configuration.WSMinRetryWait,
+			c.configuration.WSMaxRetryWait,
+			attempt,
+		)
+
+		slog.LogAttrs(
+			ctx,
+			slog.LevelDebug,
+			"retrying connection",
+			slog.Int("attempt", attempt+1),
+			slog.Duration("wait", wait),
+			slog.Int("remaining", remain),
+			slog.Any("error", err),
+		)
+
+		// Wait before retrying
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	// All retries exhausted
+	if err == nil {
+		return fmt.Errorf("connection failed after %d attempt(s)", attempt)
+	}
+	return fmt.Errorf("connection failed after %d attempt(s): %w", attempt, err)
+}
+
+// connect performs a single connection attempt to the Omlox™ Hub websockets interface.
+func (c *Client) connect(ctx context.Context) error {
 	if !c.isClosed() {
 		// close the connection if it happens to be open
 		if err := c.Close(); err != nil {
@@ -85,7 +150,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	errg, ctx := errgroup.WithContext(ctx)
 
 	conn, _, err := websocket.Dial(ctx, wsURL.String(), &websocket.DialOptions{
 		HTTPClient: c.client,
@@ -107,19 +171,99 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	c.conn = conn
 	c.closed = false
-	c.errg = errg
 	c.cancel = cancel
 	c.mu.Unlock()
 
-	c.errg.Go(func() error {
-		return c.readLoop(ctx)
-	})
+	// Start managed goroutines with WaitGroup tracking
+	c.lifecycleWg.Add(2)
 
-	c.errg.Go(func() error {
-		return c.pingLoop(ctx)
-	})
+	go func() {
+		defer c.lifecycleWg.Done()
+		if err := c.readLoop(ctx); err != nil {
+			c.handleConnectionLoss(err)
+		}
+	}()
+
+	go func() {
+		defer c.lifecycleWg.Done()
+		if err := c.pingLoop(ctx); err != nil {
+			c.handleConnectionLoss(err)
+		}
+	}()
 
 	return nil
+}
+
+// handleConnectionLoss handles unexpected connection failures and triggers reconnection.
+// This is called by readLoop or pingLoop when they detect a connection error.
+func (c *Client) handleConnectionLoss(err error) {
+	// Check if this is a normal shutdown
+	select {
+	case <-c.shutdownCh:
+		// Normal shutdown, don't reconnect
+		return
+	default:
+	}
+
+	c.mu.RLock()
+	reconnectCtx := c.reconnectCtx
+	autoReconnect := c.configuration.WSAutoReconnect
+	c.mu.RUnlock()
+
+	// Check if auto-reconnect is disabled
+	if !autoReconnect {
+		slog.LogAttrs(
+			context.Background(),
+			slog.LevelWarn,
+			"connection lost, auto-reconnect disabled",
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	// Check if reconnection context is cancelled
+	select {
+	case <-reconnectCtx.Done():
+		// Reconnection cancelled, don't reconnect
+		return
+	default:
+	}
+
+	// Connection was lost unexpectedly, attempt to reconnect
+	slog.LogAttrs(
+		context.Background(),
+		slog.LevelWarn,
+		"connection lost, attempting to reconnect",
+		slog.Any("error", err),
+	)
+
+	c.mu.Lock()
+	c.reconnecting = true
+	c.mu.Unlock()
+
+	// Attempt to reconnect with backoff
+	if err := c.reconnect(reconnectCtx); err != nil {
+		slog.LogAttrs(
+			context.Background(),
+			slog.LevelError,
+			"reconnection failed",
+			slog.Any("error", err),
+		)
+		c.mu.Lock()
+		c.reconnecting = false
+		c.mu.Unlock()
+		return
+	}
+
+	c.mu.Lock()
+	c.reconnecting = false
+	c.mu.Unlock()
+
+	slog.LogAttrs(
+		context.Background(),
+		slog.LevelInfo,
+		"successfully reconnected",
+	)
 }
 
 // Publish a message to the Omlox Hub.
@@ -265,9 +409,7 @@ func (c *Client) pingLoop(ctx context.Context) error {
 
 // readLoop that will handle incomming data.
 func (c *Client) readLoop(ctx context.Context) error {
-	defer c.clearSubs()
-
-	// set the client to closed state
+	// set the client to closed state when this goroutine exits
 	defer func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -320,6 +462,137 @@ func (c *Client) readLoop(ctx context.Context) error {
 
 		c.handleMessage(ctx, &wrObj)
 	}
+}
+
+// reconnect attempts to re-establish the WebSocket connection with retry logic.
+func (c *Client) reconnect(ctx context.Context) error {
+	var err error
+	var shouldRetry bool
+	var attempt int
+
+	for attempt = 0; ; attempt++ {
+		err = c.connect(ctx)
+		if err == nil {
+			// Connection successful, restore subscriptions
+			return c.restoreSubscriptions(ctx)
+		}
+
+		// Check if we should retry
+		shouldRetry, err = c.configuration.WSCheckRetry(ctx, attempt, err)
+		if !shouldRetry {
+			break
+		}
+
+		// Check retry limit
+		remain := c.configuration.WSMaxRetries - attempt
+		if c.configuration.WSMaxRetries >= 0 && remain <= 0 {
+			break
+		}
+
+		// Calculate backoff wait time
+		wait := c.configuration.WSBackoff(
+			c.configuration.WSMinRetryWait,
+			c.configuration.WSMaxRetryWait,
+			attempt,
+		)
+
+		slog.LogAttrs(
+			ctx,
+			slog.LevelDebug,
+			"retrying reconnection",
+			slog.Int("attempt", attempt+1),
+			slog.Duration("wait", wait),
+			slog.Int("remaining", remain),
+			slog.Any("error", err),
+		)
+
+		// Wait before retrying
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	// All retries exhausted
+	if err == nil {
+		return fmt.Errorf("reconnection failed after %d attempt(s)", attempt)
+	}
+	return fmt.Errorf("reconnection failed after %d attempt(s): %w", attempt, err)
+}
+
+// restoreSubscriptions re-establishes all active subscriptions after reconnection.
+func (c *Client) restoreSubscriptions(ctx context.Context) error {
+	// Capture subscriptions that need to be restored
+	c.mu.RLock()
+	subsToRestore := make(map[int]struct {
+		topic  Topic
+		params Parameters
+		oldCh  chan *WrapperObject
+	})
+	for sid, sub := range c.subs {
+		subsToRestore[sid] = struct {
+			topic  Topic
+			params Parameters
+			oldCh  chan *WrapperObject
+		}{
+			topic:  sub.topic,
+			params: sub.params,
+			oldCh:  sub.mch,
+		}
+	}
+	c.mu.RUnlock()
+
+	slog.LogAttrs(
+		ctx,
+		slog.LevelInfo,
+		"restoring subscriptions",
+		slog.Int("count", len(subsToRestore)),
+	)
+
+	for sid, params := range subsToRestore {
+		sub, err := c.subscribe(ctx, params.topic, params.params)
+		if err != nil {
+			slog.LogAttrs(
+				ctx,
+				slog.LevelError,
+				"failed to restore subscription",
+				slog.Int("sid", sid),
+				slog.String("topic", string(params.topic)),
+				slog.Any("error", err),
+			)
+			// Continue trying to restore other subscriptions
+			continue
+		}
+
+		// Route new subscription messages to the old subscription's channel
+		// This ensures consumers don't need to resubscribe after reconnection
+		go func(oldCh, newCh chan *WrapperObject) {
+			for msg := range newCh {
+				select {
+				case oldCh <- msg:
+				case <-time.After(chanSendTimeout):
+					slog.LogAttrs(
+						context.Background(),
+						slog.LevelWarn,
+						"timeout sending restored subscription message",
+					)
+				}
+			}
+		}(params.oldCh, sub.mch)
+
+		slog.LogAttrs(
+			ctx,
+			slog.LevelDebug,
+			"subscription restored",
+			slog.Int("sid", sid),
+			slog.String("topic", string(params.topic)),
+		)
+	}
+
+	return nil
 }
 
 // handleMessage received from the Omlox Hub server.
@@ -416,6 +689,23 @@ func (c *Client) clearSubs() {
 // Close releases any resources held by the client,
 // such as connections, memory and goroutines.
 func (c *Client) Close() error {
+	// Signal shutdown to prevent reconnection
+	select {
+	case <-c.shutdownCh:
+		// Already closed
+		return nil
+	default:
+		close(c.shutdownCh)
+	}
+
+	// Stop automatic reconnection
+	c.mu.Lock()
+	if c.reconnectCancel != nil {
+		c.reconnectCancel()
+	}
+	c.mu.Unlock()
+
+	// Close WebSocket connection
 	if !c.isClosed() {
 		err := c.conn.Close(websocket.StatusNormalClosure, "")
 		if err != nil {
@@ -423,10 +713,18 @@ func (c *Client) Close() error {
 		}
 	}
 
-	// close the client context
-	c.cancel()
+	// Cancel context to stop goroutines
+	if c.cancel != nil {
+		c.cancel()
+	}
 
-	return c.errg.Wait()
+	// Wait for all goroutines to finish
+	c.lifecycleWg.Wait()
+
+	// Clear subscriptions after all goroutines have stopped
+	c.clearSubs()
+
+	return nil
 }
 
 // isClosed reports if the client closed.
@@ -434,6 +732,21 @@ func (c *Client) isClosed() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.closed
+}
+
+// IsConnected reports if the client is currently connected to the WebSocket.
+// Returns true if connected, false if closed or reconnecting.
+func (c *Client) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.closed && !c.reconnecting
+}
+
+// IsReconnecting reports if the client is currently attempting to reconnect.
+func (c *Client) IsReconnecting() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reconnecting
 }
 
 func upgradeToWebsocketScheme(u *url.URL) error {

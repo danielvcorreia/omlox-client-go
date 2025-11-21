@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"sync"
 
-	"golang.org/x/sync/errgroup"
 	"nhooyr.io/websocket"
 )
 
@@ -33,12 +32,18 @@ type Client struct {
 
 	// websockets client fields
 
-	errg   *errgroup.Group
-	cancel context.CancelFunc
+	lifecycleWg sync.WaitGroup
+	shutdownCh  chan bool
+	cancel      context.CancelFunc
 
 	// websockets connection
 	conn   *websocket.Conn
 	closed bool
+
+	// reconnection support
+	reconnectCtx    context.Context
+	reconnectCancel context.CancelFunc
+	reconnecting    bool
 
 	// subscriptions
 	subs map[int]*Subcription
@@ -81,7 +86,8 @@ func newClient(addr string, configuration ClientConfiguration) (*Client, error) 
 
 		baseAddress: address,
 
-		closed: true,
+		closed:     true,
+		shutdownCh: make(chan bool),
 		pending: make(chan chan struct {
 			sid int
 			err error
