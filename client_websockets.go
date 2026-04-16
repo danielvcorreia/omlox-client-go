@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/url"
 	"time"
@@ -69,8 +70,34 @@ func Connect(ctx context.Context, addr string, options ...ClientOption) (*Client
 	return c, nil
 }
 
-// Connect dials the Omlox™ Hub websockets interface.
+// Connect dials the Omlox™ Hub websockets interface and, if reconnection
+// feature is enabled, starts a background goroutine that will automatically
+// reconnect and resubscribe on connection loss.
 func (c *Client) Connect(ctx context.Context) error {
+	if err := c.dial(ctx); err != nil {
+		return err
+	}
+
+	if c.configuration.Reconnect != nil {
+		rctx, rcancel := context.WithCancel(ctx)
+		done := make(chan struct{})
+
+		c.mu.Lock()
+		c.reconnectCancel = rcancel
+		c.reconnectDone = done
+		c.mu.Unlock()
+
+		go func() {
+			defer close(done)
+			c.reconnectLoop(rctx)
+		}()
+	}
+
+	return nil
+}
+
+// dial establishes the websocket connection and starts the read and ping loops.
+func (c *Client) dial(ctx context.Context) error {
 	if !c.isClosed() {
 		// close the connection if it happens to be open
 		if err := c.Close(); err != nil {
@@ -120,6 +147,62 @@ func (c *Client) Connect(ctx context.Context) error {
 	})
 
 	return nil
+}
+
+// reconnectLoop retries reconnection on connection failures until either operation completes
+// without error or context is canceled.
+func (c *Client) reconnectLoop(ctx context.Context) {
+	for {
+		// block until the current connection's goroutines finish
+		c.errg.Wait()
+
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		slog.LogAttrs(ctx, slog.LevelInfo, "connection lost. attempting reconnect")
+
+		var attempt int
+		for {
+			wait := reconnectBackoff(
+				c.configuration.Reconnect.MinWait,
+				c.configuration.Reconnect.MaxWait,
+				attempt,
+			)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+
+			if err := c.dial(ctx); err != nil {
+				attempt++
+				slog.LogAttrs(ctx, slog.LevelWarn, "reconnect dial failed",
+					slog.Any("err", err),
+					slog.Int("attempt", attempt),
+				)
+				continue
+			}
+
+			slog.LogAttrs(ctx, slog.LevelInfo, "reconnected successfully")
+			c.resubscribe(ctx)
+			break
+		}
+	}
+}
+
+// reconnectBackoff calculates a backoff duration with full jitter.
+func reconnectBackoff(min, max time.Duration, attempt int) time.Duration {
+	d := min * (1 << uint(attempt))
+	if d > max || d <= 0 {
+		d = max
+	}
+
+	// full jitter uniformly random in [0, d)
+	return time.Duration(rand.Int63n(int64(d)))
 }
 
 // Publish a message to the Omlox Hub.
@@ -226,6 +309,80 @@ func (c *Client) subscribe(ctx context.Context, topic Topic, params Parameters) 
 	return sub, nil
 }
 
+// resubscribe sends subscribe messages for all existing subscriptions after
+// a successful reconnection, reusing the existing Subcription objects so that
+// callers continue to receive messages on their existing channels.
+func (c *Client) resubscribe(ctx context.Context) {
+	c.mu.RLock()
+	subs := make([]*Subcription, 0, len(c.subs))
+	for _, sub := range c.subs {
+		subs = append(subs, sub)
+	}
+	c.mu.RUnlock()
+
+	for _, sub := range subs {
+		if err := c.resubscribeOne(ctx, sub); err != nil {
+			slog.LogAttrs(ctx, slog.LevelWarn, "resubscribe failed",
+				slog.String("topic", string(sub.topic)),
+				slog.Any("err", err),
+			)
+		}
+	}
+}
+
+// resubscribeOne sends a subscribe message for a single existing subscription
+// and updates its ID in the subscriptions map.
+func (c *Client) resubscribeOne(ctx context.Context, sub *Subcription) error {
+	ctx, cancel := context.WithTimeout(ctx, SubscriptionTimeout)
+	defer cancel()
+
+	await := make(chan struct {
+		sid int
+		err error
+	})
+	defer close(await)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case c.pending <- await:
+	}
+
+	wrObj := &WrapperObject{
+		Event:  EventSubscribe,
+		Topic:  sub.topic,
+		Params: sub.params,
+	}
+
+	if err := c.publish(ctx, wrObj); err != nil {
+		<-c.pending
+		return err
+	}
+
+	var r struct {
+		sid int
+		err error
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r = <-await:
+	}
+
+	if r.err != nil {
+		return r.err
+	}
+
+	c.mu.Lock()
+	delete(c.subs, sub.sid)
+	sub.sid = 0 // BUG: deephub doesn't return the sid in subsequent messages (NEEDS FIX!)
+	c.subs[sub.sid] = sub
+	c.mu.Unlock()
+
+	return nil
+}
+
 // ping pong loop that manages the websocket connection health.
 func (c *Client) pingLoop(ctx context.Context) error {
 	t := time.NewTicker(pingPeriod)
@@ -265,7 +422,7 @@ func (c *Client) pingLoop(ctx context.Context) error {
 
 // readLoop that will handle incomming data.
 func (c *Client) readLoop(ctx context.Context) error {
-	defer c.clearSubs()
+	defer c.drainPending()
 
 	// set the client to closed state
 	defer func() {
@@ -397,8 +554,11 @@ func (c *Client) clearSubs() {
 		sub.close()
 		delete(c.subs, sid)
 	}
+}
 
-	// close any pending subscription
+// drainPending fails any in-flight subscription request without closing the
+// pending channel, so it can be reused after reconnection.
+func (c *Client) drainPending() {
 	select {
 	case pending := <-c.pending:
 		pending <- struct {
@@ -409,13 +569,21 @@ func (c *Client) clearSubs() {
 		}
 	default:
 	}
-
-	close(c.pending)
 }
 
 // Close releases any resources held by the client,
 // such as connections, memory and goroutines.
 func (c *Client) Close() error {
+	c.mu.RLock()
+	rcancel := c.reconnectCancel
+	rdone := c.reconnectDone
+	c.mu.RUnlock()
+
+	// stop the reconnect loop first
+	if rcancel != nil {
+		rcancel()
+	}
+
 	if !c.isClosed() {
 		err := c.conn.Close(websocket.StatusNormalClosure, "")
 		if err != nil {
@@ -423,10 +591,24 @@ func (c *Client) Close() error {
 		}
 	}
 
-	// close the client context
-	c.cancel()
+	c.mu.RLock()
+	cancel := c.cancel
+	errg := c.errg
+	c.mu.RUnlock()
 
-	return c.errg.Wait()
+	// close the client context
+	cancel()
+
+	err := errg.Wait()
+
+	// wait for reconnect goroutine to fully exit
+	if rdone != nil {
+		<-rdone
+	}
+
+	c.clearSubs()
+
+	return err
 }
 
 // isClosed reports if the client closed.

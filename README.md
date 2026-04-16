@@ -17,6 +17,7 @@ It specifies open interfaces for an interoperable localization system that enabl
    - [Getting Started](#getting-started)
    - [Websockets](#websockets)
      - [Subscription](#subscription)
+     - [Reconnection](#reconnection)
    - [Error Handling](#error-handling)
 1. [Status](#status)
    - [Schemas](#schemas)
@@ -94,6 +95,30 @@ if err != nil {
 for location := range omlox.ReceiveAs[omlox.Location](sub) {
     _ = location // handle location update
 }
+```
+
+#### Reconnection
+
+The client supports automatic WebSocket reconnection with exponential backoff with full jitter.
+
+```go
+// Create client with websocket reconnection
+// Dials a Omlox Hub websocket interface, subscribes to
+// the location_updates topic and listens to new
+// location messages.
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+client, err := omlox.Connect(
+    ctx,
+    "localhost:7081/v2",
+    omlox.WithReconnect(time.Second, 30*time.Second),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
 ```
 
 ### Error Handling
