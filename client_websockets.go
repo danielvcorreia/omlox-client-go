@@ -80,16 +80,14 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	if c.configuration.Reconnect != nil {
 		rctx, rcancel := context.WithCancel(ctx)
-		done := make(chan struct{})
+		rdone := make(chan struct{})
 
-		c.mu.Lock()
 		c.reconnectCancel = rcancel
-		c.reconnectDone = done
-		c.mu.Unlock()
+		c.reconnectDone = rdone
 
 		go func() {
-			defer close(done)
-			c.reconnectLoop(rctx)
+			defer close(rdone)
+			c.reconnectLoop(ctx, rctx)
 		}()
 	}
 
@@ -149,33 +147,25 @@ func (c *Client) dial(ctx context.Context) error {
 	return nil
 }
 
-// reconnectLoop retries reconnection on connection failures until either operation completes
-// without error or context is canceled.
-func (c *Client) reconnectLoop(ctx context.Context) {
+// reconnectLoop tries to re-establish the websocket connection on connection failures
+// until either the reconnect operation completes without error or context is canceled.
+func (c *Client) reconnectLoop(ctx context.Context, reconnectCtx context.Context) {
 	for {
 		// block until the current connection's goroutines finish
 		c.errg.Wait()
 
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		slog.LogAttrs(ctx, slog.LevelInfo, "connection lost. attempting reconnect")
-
 		var attempt int
 		for {
-			wait := reconnectBackoff(
+			delay := backoff(
 				c.configuration.Reconnect.MinWait,
 				c.configuration.Reconnect.MaxWait,
 				attempt,
 			)
 
 			select {
-			case <-ctx.Done():
+			case <-reconnectCtx.Done():
 				return
-			case <-time.After(wait):
+			case <-time.After(delay):
 			}
 
 			if err := c.dial(ctx); err != nil {
@@ -187,21 +177,21 @@ func (c *Client) reconnectLoop(ctx context.Context) {
 				continue
 			}
 
-			slog.LogAttrs(ctx, slog.LevelInfo, "reconnected successfully")
-			c.resubscribe(ctx)
+			slog.LogAttrs(reconnectCtx, slog.LevelInfo, "reconnected successfully")
+			c.resubscribe(reconnectCtx)
 			break
 		}
 	}
 }
 
-// reconnectBackoff calculates a backoff duration with full jitter.
-func reconnectBackoff(min, max time.Duration, attempt int) time.Duration {
+// backoff calculates the time to wait based on the number of attempts with
+// exponential backoff strategy and full jitter.
+func backoff(min, max time.Duration, attempt int) time.Duration {
 	d := min * (1 << uint(attempt))
 	if d > max || d <= 0 {
 		d = max
 	}
 
-	// full jitter uniformly random in [0, d)
 	return time.Duration(rand.Int63n(int64(d)))
 }
 
@@ -251,50 +241,13 @@ func (c *Client) Subscribe(ctx context.Context, topic Topic, params ...Parameter
 // Subsequent subscriptions will wait while the pending one is waiting for an ID from the server.
 // Since each subscription on a topic can have a distinct parameters, we must synchronisly wait to match each one to its ID.
 func (c *Client) subscribe(ctx context.Context, topic Topic, params Parameters) (*Subcription, error) {
-	// channel to await subscription confirmation
-	await := make(chan struct {
-		sid int
-		err error
-	})
-	defer close(await)
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	// lock for pending subscription confirmation.
-	// the pending will be freed by the subribed message handler.
-	case c.pending <- await:
-	}
-
-	wrObj := &WrapperObject{
-		Event:   EventSubscribe,
-		Topic:   topic,
-		Params:  params,
-		Payload: nil,
-	}
-
-	if err := c.publish(ctx, wrObj); err != nil {
-		<-c.pending // clear pending subscription
+	_, err := c.sendSubscribe(ctx, topic, params) // BUG: use returned sid when bug is fixed
+	if err != nil {
 		return nil, err
 	}
 
-	// wait for subcription ID
-	var r struct {
-		sid int
-		err error
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r = <-await:
-	}
-
-	if r.err != nil {
-		return nil, r.err
-	}
-
 	sub := &Subcription{
-		// sid:    r.sid,
+		// sid:    sid,
 		sid:    0, // BUG: deephub doesn't return the sid in subsequent messages (NEEDS FIX!)
 		topic:  topic,
 		params: params,
@@ -309,6 +262,54 @@ func (c *Client) subscribe(ctx context.Context, topic Topic, params Parameters) 
 	return sub, nil
 }
 
+// sendSubscribe handles the subscribe protocol exchange. Sends a subscribe
+// message to the server, waits for the subscription ID confirmation, and returns it.
+func (c *Client) sendSubscribe(ctx context.Context, topic Topic, params Parameters) (int, error) {
+	// channel to await subscription confirmation
+	await := make(chan struct {
+		sid int
+		err error
+	})
+	defer close(await)
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	// lock for pending subscription confirmation.
+	// the pending will be freed by the subribed message handler.
+	case c.pending <- await:
+	}
+
+	wrObj := &WrapperObject{
+		Event:   EventSubscribe,
+		Topic:   topic,
+		Params:  params,
+		Payload: nil,
+	}
+
+	if err := c.publish(ctx, wrObj); err != nil {
+		<-c.pending // clear pending subscription
+		return 0, err
+	}
+
+	// wait for subcription ID
+	var r struct {
+		sid int
+		err error
+	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case r = <-await:
+	}
+
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	return r.sid, nil
+}
+
 // resubscribe sends subscribe messages for all existing subscriptions after
 // a successful reconnection, reusing the existing Subcription objects so that
 // callers continue to receive messages on their existing channels.
@@ -321,7 +322,7 @@ func (c *Client) resubscribe(ctx context.Context) {
 	c.mu.RUnlock()
 
 	for _, sub := range subs {
-		if err := c.resubscribeOne(ctx, sub); err != nil {
+		if err := c.resubscribeSub(ctx, sub); err != nil {
 			slog.LogAttrs(ctx, slog.LevelWarn, "resubscribe failed",
 				slog.String("topic", string(sub.topic)),
 				slog.Any("err", err),
@@ -330,48 +331,15 @@ func (c *Client) resubscribe(ctx context.Context) {
 	}
 }
 
-// resubscribeOne sends a subscribe message for a single existing subscription
-// and updates its ID in the subscriptions map.
-func (c *Client) resubscribeOne(ctx context.Context, sub *Subcription) error {
+// resubscribeSub re-registers an existing subscription
+// after a reconnection, reusing the existing Subcription object.
+func (c *Client) resubscribeSub(ctx context.Context, sub *Subcription) error {
 	ctx, cancel := context.WithTimeout(ctx, SubscriptionTimeout)
 	defer cancel()
 
-	await := make(chan struct {
-		sid int
-		err error
-	})
-	defer close(await)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case c.pending <- await:
-	}
-
-	wrObj := &WrapperObject{
-		Event:  EventSubscribe,
-		Topic:  sub.topic,
-		Params: sub.params,
-	}
-
-	if err := c.publish(ctx, wrObj); err != nil {
-		<-c.pending
+	_, err := c.sendSubscribe(ctx, sub.topic, sub.params) // BUG: use returned sid when bug is fixed
+	if err != nil {
 		return err
-	}
-
-	var r struct {
-		sid int
-		err error
-	}
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case r = <-await:
-	}
-
-	if r.err != nil {
-		return r.err
 	}
 
 	c.mu.Lock()
@@ -574,14 +542,14 @@ func (c *Client) drainPending() {
 // Close releases any resources held by the client,
 // such as connections, memory and goroutines.
 func (c *Client) Close() error {
-	c.mu.RLock()
-	rcancel := c.reconnectCancel
-	rdone := c.reconnectDone
-	c.mu.RUnlock()
+	// stop the reconnect loop
+	if c.reconnectCancel != nil {
+		c.reconnectCancel()
+	}
 
-	// stop the reconnect loop first
-	if rcancel != nil {
-		rcancel()
+	// wait for reconnect goroutine to fully exit
+	if c.reconnectDone != nil {
+		<-c.reconnectDone
 	}
 
 	if !c.isClosed() {
@@ -596,18 +564,10 @@ func (c *Client) Close() error {
 	errg := c.errg
 	c.mu.RUnlock()
 
-	// close the client context
 	cancel()
-
 	err := errg.Wait()
 
-	// wait for reconnect goroutine to fully exit
-	if rdone != nil {
-		<-rdone
-	}
-
 	c.clearSubs()
-
 	return err
 }
 
