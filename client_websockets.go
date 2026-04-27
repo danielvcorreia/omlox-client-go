@@ -161,11 +161,13 @@ func (c *Client) reconnectLoop(ctx context.Context, reconnectCtx context.Context
 				c.configuration.Reconnect.MaxWait,
 				attempt,
 			)
+			timer := time.NewTimer(delay)
 
 			select {
 			case <-reconnectCtx.Done():
+				timer.Stop()
 				return
-			case <-time.After(delay):
+			case <-timer.C:
 			}
 
 			if err := c.dial(ctx); err != nil {
