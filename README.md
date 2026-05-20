@@ -148,7 +148,7 @@ Following is the current checklist of the implemented schemas and API methods.
 | Collision                     |                |
 | CollisionEvent                |                |
 | Error                         |       ✅       |
-| Fence                         |                |
+| Fence                         |       ✅       |
 | FenceEvent                    |                |
 | LineString                    |                |
 | LocatingRule                  |                |
