@@ -41,6 +41,10 @@ type Client struct {
 	conn   *websocket.Conn
 	closed bool
 
+	// reconnect lifecycle
+	reconnectCancel context.CancelFunc
+	reconnectDone   chan struct{}
+
 	// subscriptions
 	subs map[int]*Subcription
 
