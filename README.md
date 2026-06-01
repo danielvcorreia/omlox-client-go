@@ -103,8 +103,8 @@ The client supports automatic WebSocket reconnection with exponential backoff wi
 
 ```go
 // Create client with websocket reconnection
-// Dials a Omlox Hub websocket interface, subscribes to
-// the location_updates topic and listens to new
+// Dials a Omlox Hub websocket interface, subscribes
+// to the location_updates topic and listens to new
 // location messages.
 
 ctx, cancel := context.WithCancel(context.Background())
