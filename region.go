@@ -5,7 +5,6 @@ package omlox
 
 import (
 	"errors"
-	"strings"
 
 	"github.com/tidwall/geojson"
 	"github.com/tidwall/geojson/geometry"
@@ -47,13 +46,16 @@ func (r *Region) UnmarshalJSON(data []byte) error {
 }
 
 func (r Region) Equal(u Region) bool {
-	if r.NumPoints() != u.NumPoints() {
-		return false
+	switch objectR := r.Object.(type) {
+	case *geojson.Point:
+		if objectU, ok := u.Object.(*geojson.Point); ok {
+			return Point{*objectR}.Equal(Point{*objectU})
+		}
+	case *geojson.Polygon:
+		if objectU, ok := u.Object.(*geojson.Polygon); ok {
+			return Polygon{*objectR}.Equal(Polygon{*objectU})
+		}
 	}
 
-	if strings.Compare(r.JSON(), u.JSON()) != 0 {
-		return false
-	}
-
-	return true
+	return false
 }
