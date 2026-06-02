@@ -58,3 +58,33 @@ func TestRegionUnmarshal(t *testing.T) {
 		}
 	}
 }
+
+var regionEqualTestCases = []struct {
+	name     string
+	r        *Region
+	u        *Region
+	expected bool
+}{
+	{
+		name: "different-region-objects",
+		r:    NewRegionPoint(geometry.Point{X: 7.815694, Y: 48.13021599999995}),
+		u: NewRegionPolygon(geometry.NewPoly([]geometry.Point{
+			{X: 0.0, Y: 0.0},
+			{X: 1.0, Y: 0.0},
+			{X: 1.0, Y: 1.0},
+			{X: 0.0, Y: 1.0},
+			{X: 0.0, Y: 0.0},
+		}, nil, geometry.DefaultIndexOptions)),
+		expected: false,
+	},
+}
+
+func TestRegionEqual(t *testing.T) {
+	for _, tc := range regionEqualTestCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if result := tc.r.Equal(*tc.u); result != tc.expected {
+				t.Errorf("Equal() mismatch want: %v, got: %v", tc.expected, result)
+			}
+		})
+	}
+}
