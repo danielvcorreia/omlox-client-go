@@ -30,6 +30,7 @@ type Client struct {
 
 	Trackables TrackablesAPI
 	Providers  ProvidersAPI
+	Fences     FencesAPI
 
 	// websockets client fields
 
@@ -98,6 +99,10 @@ func newClient(addr string, configuration ClientConfiguration) (*Client, error) 
 	}
 
 	c.Providers = ProvidersAPI{
+		client: &c,
+	}
+
+	c.Fences = FencesAPI{
 		client: &c,
 	}
 
