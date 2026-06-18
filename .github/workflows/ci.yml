@@ -29,7 +29,7 @@ jobs:
 
       - name: Ensure the code has been properly regenerated
         run: |
-          readonly changed_files="$(git diff --stat)"
+          readonly changed_files="$(git status --porcelain)"
           if [[ "${changed_files}" != "" ]]; then
             echo "Found differences after running 'go generate ./...'"
             echo "Please run 'go generate ./...' & commit the changed files:"
