@@ -24,15 +24,13 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
-      - name: Regenerate code
-        run: nix develop -c go generate ./...
-
-      - name: Ensure the code has been properly regenerated
+      - name: Ensure the code has been properly regenerated with 'nix develop -c go generate ./...'
         run: |
+          nix develop -c go generate ./...
           readonly changed_files="$(git status --porcelain)"
           if [[ "${changed_files}" != "" ]]; then
-            echo "Found differences after running 'go generate ./...'"
-            echo "Please run 'go generate ./...' & commit the changed files:"
+            echo "Found differences after running 'nix develop -c go generate ./...'"
+            echo "Please run 'nix develop -c go generate ./...' & commit the changed files:"
             echo "${changed_files}"
             exit 1
           fi
